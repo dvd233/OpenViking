@@ -8,7 +8,10 @@ import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
+from litellm.llms.ollama.chat.transformation import OllamaChatConfig
 from openai import OpenAI
+from volcenginesdkarkruntime._exceptions import ArkAPIStatusError
 
 from openviking.models.vlm.backends.litellm_vlm import (
     LiteLLMVLMProvider,
@@ -344,13 +347,31 @@ class TestOpenAIVLMClientRetries:
         assert call_kwargs["timeout"] == 12.0
         assert call_kwargs["max_retries"] == 0
 
+    @pytest.mark.parametrize(
+        ("status_code", "message", "expected_attempts"),
+        [
+            (400, "Total tokens of multi-modal content and text exceed max message tokens.", 1),
+            (400, "The parameter model is invalid.", 1),
+            (401, "Unauthorized", 1),
+            (503, "Service Unavailable", 6),
+        ],
+    )
     @patch("volcenginesdkarkruntime.AsyncArk")
-    def test_volcengine_async_client_applies_timeout_and_disables_sdk_retries(
-        self,
-        mock_async_ark_class,
+    def test_volcengine_async_client_uses_shared_retry_policy(
+        self, mock_async_ark_class, status_code, message, expected_attempts
     ):
-        mock_async_ark_class.return_value = MagicMock()
-
+        error = ArkAPIStatusError(
+            f"Error code: {status_code} - {message}",
+            response=httpx.Response(
+                status_code,
+                request=httpx.Request("POST", "https://example.invalid/chat/completions"),
+            ),
+            body={"error": {"message": message}},
+            request_id="test-request",
+        )
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(side_effect=error)
+        mock_async_ark_class.return_value = mock_client
         vlm = VolcEngineVLM(
             {
                 "api_key": "sk-test",
@@ -360,10 +381,13 @@ class TestOpenAIVLMClientRetries:
             }
         )
 
-        _ = vlm._build_async_client()
+        with patch("openviking.utils.model_retry.asyncio.sleep", new=AsyncMock()):
+            with pytest.raises(ArkAPIStatusError) as raised:
+                asyncio.run(vlm.get_completion_async("hello"))
 
-        mock_async_ark_class.assert_called_once()
-        call_kwargs = mock_async_ark_class.call_args[1]
+        assert raised.value is error
+        assert mock_client.chat.completions.create.await_count == expected_attempts
+        call_kwargs = mock_async_ark_class.call_args.kwargs
         assert call_kwargs["timeout"] == 12.0
         assert call_kwargs["max_retries"] == 0
 
@@ -531,7 +555,10 @@ class TestVLMExtraRequestBody:
         kwargs = vlm._build_text_kwargs(prompt="hello")
 
         # Ollama models also get a default num_ctx; the explicit think is kept.
-        assert kwargs["extra_body"] == {"think": False, "num_ctx": 16384}
+        # num_ctx must be top-level so LiteLLM maps it into Ollama's `options`;
+        # inside extra_body it is forwarded verbatim and silently ignored.
+        assert kwargs["num_ctx"] == 16384
+        assert kwargs["extra_body"] == {"think": False}
 
     def test_ollama_defaults_num_ctx_and_think(self):
         """Ollama models get a larger context window and thinking disabled by default."""
@@ -545,7 +572,8 @@ class TestVLMExtraRequestBody:
 
         kwargs = vlm._build_text_kwargs(prompt="hello")
 
-        assert kwargs["extra_body"] == {"num_ctx": 16384, "think": False}
+        assert kwargs["num_ctx"] == 16384
+        assert kwargs["extra_body"] == {"think": False}
 
     def test_ollama_extra_request_body_overrides_num_ctx(self):
         """An explicit num_ctx in extra_request_body is not overridden by the default."""
@@ -560,7 +588,40 @@ class TestVLMExtraRequestBody:
 
         kwargs = vlm._build_text_kwargs(prompt="hello")
 
-        assert kwargs["extra_body"] == {"num_ctx": 32768, "think": False}
+        assert kwargs["num_ctx"] == 32768
+        assert "num_ctx" not in kwargs["extra_body"]
+        assert kwargs["extra_body"] == {"think": False}
+
+    def test_ollama_num_ctx_lands_in_ollama_options_on_the_wire(self):
+        """The request LiteLLM actually sends must carry num_ctx under `options`.
+
+        Asserting the built kwargs only proves where OV puts the value; this
+        checks the field Ollama reads, which is what #5030 is about.
+        """
+        vlm = LiteLLMVLMProvider(
+            {
+                "model": "ollama/qwen3.5:4b",
+                "provider": "litellm",
+                "api_base": "http://127.0.0.1:11434",
+                "extra_request_body": {"num_ctx": 32768},
+            }
+        )
+        kwargs = vlm._build_text_kwargs(prompt="hello")
+
+        body = OllamaChatConfig().transform_request(
+            model="qwen3.5:4b",
+            messages=kwargs["messages"],
+            optional_params={
+                k: v
+                for k, v in kwargs.items()
+                if k not in ("model", "messages", "timeout", "api_key", "api_base")
+            },
+            litellm_params={},
+            headers={},
+        )
+
+        assert body["options"]["num_ctx"] == 32768
+        assert "num_ctx" not in body
 
     def test_non_ollama_model_gets_no_num_ctx(self):
         """num_ctx is Ollama-specific and must not leak into other providers."""

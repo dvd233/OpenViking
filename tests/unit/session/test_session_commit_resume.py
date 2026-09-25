@@ -108,7 +108,7 @@ async def test_commit_retention_boundary_and_pending_tokens_after_reload(
         else {}
     )
     result = await session.commit_async(keep_recent_count=keep_count, **turn_options)
-    archived = await session._read_archive_messages(result["archive_uri"])
+    archived = await session._archives.read_messages(result["archive_uri"])
     retained = messages[archive_count:]
     assert [message.id for message in archived] == [m.id for m in messages[:archive_count]]
     assert [message.id for message in session.messages] == [m.id for m in retained]
@@ -226,8 +226,8 @@ async def test_session_context_skips_pending_archive_with_missing_messages(monke
         session_uri=session_uri,
     )
     monkeypatch.setattr(
-        session,
-        "_list_archive_refs",
+        session._archives,
+        "list_refs",
         AsyncMock(
             return_value=[{"archive_id": "archive_001", "archive_uri": archive_uri, "index": 1}]
         ),
@@ -296,9 +296,11 @@ def test_session_commit_message_ignores_unknown_fields():
             "archive_uri": "viking://user/default/sessions/session-1/history/archive_001",
             "user": {"account_id": "default", "user_id": "default"},
             "actor_peer_id": "visitor-a",
+            "usage_uris": ["viking://resources/legacy"],
         }
     )
 
     assert message.task_id == "task-1"
     assert message.auto_commit_policy == {}
     assert "actor_peer_id" not in message.to_dict()
+    assert "usage_uris" not in message.to_dict()
